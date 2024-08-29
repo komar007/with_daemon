@@ -11,9 +11,9 @@ use log::{debug, error, info};
 use procfs::{CurrentSI, KernelStats};
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufStream, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{UnixListener, UnixStream as TokioUnixStream},
-    pin, stream,
+    pin,
     sync::RwLock,
 };
 
@@ -73,9 +73,9 @@ async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
         .await
         .map_err(|e| format!("error reading from fork parent: {e}"))?;
     let ready: ReadyToken =
-        num::FromPrimitive::from_u32(ready).expect("expected known value of ready token");
+        num::FromPrimitive::from_u32(ready).expect("ready token should have known value");
     info!("parent ready, {:?}, starting client", ready);
-    let mut stream = connect_to_daemon(ready).await;
+    let mut stream = connect_to_daemon(ready).await?;
     let pids: Result<Vec<i32>, _> = args().skip(1).map(|a| a.parse()).collect();
     let pids = pids.map_err(|_| {
         print_usage();
@@ -110,21 +110,20 @@ async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
     Ok(())
 }
 
-async fn connect_to_daemon(ready: ReadyToken) -> TokioUnixStream {
-    let Ok(stream) = TokioUnixStream::connect(SOCKET_FILENAME).await else {
-        match ready {
-            ReadyToken::DaemonForked => panic!("forked daemon misbehaving"),
+async fn connect_to_daemon(ready: ReadyToken) -> Result<TokioUnixStream, String> {
+    match TokioUnixStream::connect(SOCKET_FILENAME).await {
+        Ok(stream) => Ok(stream),
+        Err(e) => match ready {
+            ReadyToken::DaemonForked => Err(format!("could not communicate with daemon: {e}")),
             ReadyToken::DaemonRunning => {
                 info!("daemon running, but not ready, retrying");
                 tokio::time::sleep(Duration::from_millis(DAEMON_RETRY_DELAY)).await;
-                let Ok(stream) = TokioUnixStream::connect(SOCKET_FILENAME).await else {
-                    panic!("retried connecting to daemon and failed, blood everywhere");
-                };
-                return stream;
+                TokioUnixStream::connect(SOCKET_FILENAME)
+                    .await
+                    .map_err(|e| format!("could not communicate with daemon after retry: {e}"))
             }
-        }
-    };
-    stream
+        },
+    }
 }
 
 fn print_usage() {
@@ -146,7 +145,8 @@ async fn run_daemon(other_fork: UnixStream) -> Result<(), String> {
     let mut other_fork = TokioUnixStream::from_std(other_fork)
         .map_err(|e| format!("error tokioing UnixStream to fork: {e}"))?;
     let _ = fs::remove_file(SOCKET_FILENAME).await;
-    let listener = UnixListener::bind(SOCKET_FILENAME).expect("should create socket");
+    let listener =
+        UnixListener::bind(SOCKET_FILENAME).map_err(|e| format!("error creating socket: {e}"))?;
 
     other_fork
         .write_u32(ReadyToken::DaemonForked as u32)
