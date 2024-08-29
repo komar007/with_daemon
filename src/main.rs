@@ -1,4 +1,7 @@
-use std::{collections::HashMap, env::args, hash::Hash, ops::Add, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, env::args, hash::Hash, io::Write, ops::Add, os::unix::net::UnixStream,
+    sync::Arc, time::Duration,
+};
 
 use daemonize::Daemonize;
 use fork::Fork;
@@ -7,56 +10,86 @@ use procfs::{CurrentSI, KernelStats};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
-    net::{UnixListener, UnixStream},
+    net::{UnixListener, UnixStream as TokioUnixStream},
     sync::RwLock,
 };
 
-fn main() {
+const UPDATE_INTERVAL_MS: u64 = 100;
+
+fn main() -> std::io::Result<()> {
     env_logger::init();
+    let (mut stream_child, stream_parent) = UnixStream::pair()?;
     match fork::fork() {
         Ok(Fork::Child) => {
             info!("child process");
+            drop(stream_parent);
             let daemonize = Daemonize::new().pid_file("/tmp/fire.pid");
             match daemonize.start() {
                 Ok(_) => {
                     info!("daemonized");
-                    run_daemon();
+                    run_daemon(stream_child)?;
                 }
                 Err(e) => {
+                    stream_child
+                        .write_all(&0xdeadbeefu32.to_be_bytes())
+                        .inspect_err(|e| error!("error writing to parent: {e}"))?;
                     debug!("error deamonizing: {}, assuming daemon running", e);
                 }
             };
         }
         Ok(Fork::Parent(_)) => {
-            run_client();
+            drop(stream_child);
+            run_client(stream_parent)?;
         }
         Err(_) => {
             error!("couldn't fork");
         }
     }
+    Ok(())
 }
 
 #[tokio::main]
-async fn run_client() {
-    let mut stream = UnixStream::connect("/tmp/fire.sock").await.unwrap();
+async fn run_client(other_fork: UnixStream) -> std::io::Result<()> {
+    other_fork.set_nonblocking(true)?;
+    let mut other_fork = TokioUnixStream::from_std(other_fork)
+        .inspect_err(|e| error!("error tokioing UnixStream to fork: {e}"))?;
+    let ready = other_fork
+        .read_u32()
+        .await
+        .inspect_err(|e| error!("error reading from fork parent: {e}"))?;
+    if ready != 0xdeadbeef {
+        error!("fork failed to start daemon, exitting");
+        panic!();
+    }
+    info!("parent ready, starting client");
+    let mut stream = TokioUnixStream::connect("/tmp/fire.sock").await.unwrap();
     let pid: i32 = args().nth(1).unwrap().parse().unwrap();
-    if let Err(e) = stream.write_i32(pid).await {
-        error!("error writing to server: {e}");
-        return;
-    }
-    if let Err(e) = stream.flush().await {
-        error!("error flushing stream: {e}");
-        return;
-    }
+    stream
+        .write_i32(pid)
+        .await
+        .inspect_err(|e| error!("error writing to server: {e}"))?;
+    stream
+        .flush()
+        .await
+        .inspect_err(|e| error!("error flushing stream: {e}"))?;
     while let Ok(resp) = stream.read_f32().await {
         println!("{resp}");
     }
+    Ok(())
 }
 
 #[tokio::main]
-async fn run_daemon() {
+async fn run_daemon(other_fork: UnixStream) -> std::io::Result<()> {
+    other_fork.set_nonblocking(true)?;
+    let mut other_fork = TokioUnixStream::from_std(other_fork)
+        .inspect_err(|e| error!("error tokioing UnixStream to fork: {e}"))?;
     let _ = fs::remove_file("/tmp/fire.sock").await;
     let listener = UnixListener::bind("/tmp/fire.sock").expect("should create socket");
+
+    other_fork
+        .write_u32(0xdeadbeef)
+        .await
+        .inspect_err(|e| error!("error reading from fork parent: {e}"))?;
 
     let loads: HashMap<i32, f32> = HashMap::new();
     let loads = Arc::new(RwLock::new(loads));
@@ -82,7 +115,7 @@ async fn run_daemon() {
                             error!("error flushing stream: {e}");
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                        tokio::time::sleep(Duration::from_millis(UPDATE_INTERVAL_MS)).await;
                     }
                     if let Err(e) = stream.shutdown().await {
                         error!("error shutting down: {e}");
@@ -115,7 +148,7 @@ async fn scrape_pid_loads(out_loads: Arc<RwLock<HashMap<i32, f32>>>) {
             }
         }
         *out_loads.write().await = get_cumulated(&pid_children, &loads);
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(UPDATE_INTERVAL_MS)).await;
     }
 }
 
