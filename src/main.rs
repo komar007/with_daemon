@@ -227,7 +227,7 @@ async fn scrape_pid_loads(out_loads: Arc<RwLock<HashMap<i32, f32>>>) {
 
 fn get_cur_ticks() -> u64 {
     let time = KernelStats::current().expect("can't read /proc");
-    time.total.user + time.total.system + time.total.idle
+    (time.total.user + time.total.system + time.total.idle) / time.cpu_time.len() as u64
 }
 
 fn get_cumulated<Id, V>(children: &HashMap<Id, Vec<Id>>, values: &HashMap<Id, V>) -> HashMap<Id, V>
