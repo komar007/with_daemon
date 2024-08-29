@@ -14,7 +14,13 @@ use tokio::{
     sync::RwLock,
 };
 
+#[macro_use]
+extern crate num_derive;
+
 const UPDATE_INTERVAL_MS: u64 = 100;
+const DAEMON_RETRY_DELAY: u64 = 10;
+const SOCKET_FILENAME: &str = "/tmp/fire.sock";
+const PID_FILENAME: &str = "/tmp/fire.pid";
 
 fn main() -> std::io::Result<()> {
     env_logger::init();
@@ -23,7 +29,7 @@ fn main() -> std::io::Result<()> {
         Ok(Fork::Child) => {
             info!("child process");
             drop(stream_parent);
-            let daemonize = Daemonize::new().pid_file("/tmp/fire.pid");
+            let daemonize = Daemonize::new().pid_file(PID_FILENAME);
             match daemonize.start() {
                 Ok(_) => {
                     info!("daemonized");
@@ -31,7 +37,7 @@ fn main() -> std::io::Result<()> {
                 }
                 Err(e) => {
                     stream_child
-                        .write_all(&0xdeadbeefu32.to_be_bytes())
+                        .write_all(&(ReadyToken::DaemonRunning as u32).to_be_bytes())
                         .inspect_err(|e| error!("error writing to parent: {e}"))?;
                     debug!("error deamonizing: {}, assuming daemon running", e);
                 }
@@ -57,12 +63,10 @@ async fn run_client(other_fork: UnixStream) -> std::io::Result<()> {
         .read_u32()
         .await
         .inspect_err(|e| error!("error reading from fork parent: {e}"))?;
-    if ready != 0xdeadbeef {
-        error!("fork failed to start daemon, exitting");
-        panic!();
-    }
-    info!("parent ready, starting client");
-    let mut stream = TokioUnixStream::connect("/tmp/fire.sock").await.unwrap();
+    let ready: ReadyToken =
+        num::FromPrimitive::from_u32(ready).expect("expected known value of ready token");
+    info!("parent ready, {:?}, starting client", ready);
+    let mut stream = connect_to_daemon(ready).await;
     let pid: i32 = args().nth(1).unwrap().parse().unwrap();
     stream
         .write_i32(pid)
@@ -78,16 +82,39 @@ async fn run_client(other_fork: UnixStream) -> std::io::Result<()> {
     Ok(())
 }
 
+async fn connect_to_daemon(ready: ReadyToken) -> TokioUnixStream {
+    let Ok(stream) = TokioUnixStream::connect(SOCKET_FILENAME).await else {
+        match ready {
+            ReadyToken::DaemonForked => panic!("forked daemon misbehaving"),
+            ReadyToken::DaemonRunning => {
+                info!("daemon running, but not ready, retrying");
+                tokio::time::sleep(Duration::from_millis(DAEMON_RETRY_DELAY)).await;
+                let Ok(stream) = TokioUnixStream::connect(SOCKET_FILENAME).await else {
+                    panic!("retried connecting to daemon and failed, blood everywhere");
+                };
+                return stream;
+            }
+        }
+    };
+    stream
+}
+
+#[derive(Debug, FromPrimitive)]
+enum ReadyToken {
+    DaemonForked = 0x4ea11e55,
+    DaemonRunning = 0x4ea1ab1e,
+}
+
 #[tokio::main]
 async fn run_daemon(other_fork: UnixStream) -> std::io::Result<()> {
     other_fork.set_nonblocking(true)?;
     let mut other_fork = TokioUnixStream::from_std(other_fork)
         .inspect_err(|e| error!("error tokioing UnixStream to fork: {e}"))?;
-    let _ = fs::remove_file("/tmp/fire.sock").await;
-    let listener = UnixListener::bind("/tmp/fire.sock").expect("should create socket");
+    let _ = fs::remove_file(SOCKET_FILENAME).await;
+    let listener = UnixListener::bind(SOCKET_FILENAME).expect("should create socket");
 
     other_fork
-        .write_u32(0xdeadbeef)
+        .write_u32(ReadyToken::DaemonForked as u32)
         .await
         .inspect_err(|e| error!("error reading from fork parent: {e}"))?;
 
