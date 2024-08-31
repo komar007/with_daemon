@@ -83,6 +83,10 @@ async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
         print_usage();
         None
     })?;
+    if pids.is_empty() {
+        print_usage();
+        return Err(None);
+    }
     for pid in &pids {
         stream
             .write_i32(*pid)
