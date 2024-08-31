@@ -15,13 +15,15 @@ use tokio::{
     net::{UnixListener, UnixStream as TokioUnixStream},
     pin,
     sync::RwLock,
+    time::sleep,
 };
 
 #[macro_use]
 extern crate num_derive;
 
-const UPDATE_INTERVAL_MS: u64 = 100;
-const DAEMON_RETRY_DELAY: u64 = 10;
+const UPDATE_INTERVAL: Duration = Duration::from_millis(1000);
+const DAEMON_RETRY_DELAY: Duration = Duration::from_millis(10);
+const MEASURE_PERIOD: Duration = Duration::from_millis(100);
 const SOCKET_FILENAME: &str = "/tmp/fire.sock";
 const PID_FILENAME: &str = "/tmp/fire.pid";
 
@@ -117,7 +119,7 @@ async fn connect_to_daemon(ready: ReadyToken) -> Result<TokioUnixStream, String>
             ReadyToken::DaemonForked => Err(format!("could not communicate with daemon: {e}")),
             ReadyToken::DaemonRunning => {
                 info!("daemon running, but not ready, retrying");
-                tokio::time::sleep(Duration::from_millis(DAEMON_RETRY_DELAY)).await;
+                sleep(DAEMON_RETRY_DELAY).await;
                 TokioUnixStream::connect(SOCKET_FILENAME)
                     .await
                     .map_err(|e| format!("could not communicate with daemon after retry: {e}"))
@@ -155,7 +157,13 @@ async fn run_daemon(other_fork: UnixStream) -> Result<(), String> {
 
     let loads: HashMap<i32, f32> = HashMap::new();
     let loads = Arc::new(RwLock::new(loads));
-    tokio::spawn(scrape_pid_loads(loads.clone()));
+    let loads2 = loads.clone();
+    tokio::spawn(async move {
+        loop {
+            measure_pid_loads(&loads2).await;
+            sleep(UPDATE_INTERVAL).await;
+        }
+    });
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
@@ -193,35 +201,39 @@ async fn serve_client(mut socket: TokioUnixStream, loads: Arc<RwLock<HashMap<i32
             error!("error flushing stream: {e}");
             break;
         }
-        tokio::time::sleep(Duration::from_millis(UPDATE_INTERVAL_MS)).await;
+
+        sleep(UPDATE_INTERVAL).await;
     }
     if let Err(e) = socket.shutdown().await {
         error!("error shutting down: {e}");
     }
 }
 
-async fn scrape_pid_loads(out_loads: Arc<RwLock<HashMap<i32, f32>>>) {
+async fn measure_pid_loads(out_loads: &Arc<RwLock<HashMap<i32, f32>>>) {
     let mut ticks = HashMap::new();
-    loop {
+    for _ in 0..2 {
         let mut pid_children: HashMap<_, Vec<_>> = Default::default();
         let mut loads = HashMap::new();
         for prc in procfs::process::all_processes().expect("can't read /proc") {
             let Ok(prc) = prc else { continue };
-            if let Ok(stat) = prc.stat() {
-                let cur_tics = get_cur_ticks();
-                let cur_pid_ticks = stat.utime + stat.stime;
-                let Some((last_ticks, last_pid_ticks)) =
-                    ticks.insert(stat.pid, (cur_tics, cur_pid_ticks))
-                else {
-                    continue;
-                };
-                pid_children.entry(stat.ppid).or_default().push(stat.pid);
-                let load = (cur_pid_ticks - last_pid_ticks) as f32 / (cur_tics - last_ticks) as f32;
-                loads.insert(stat.pid, load);
-            }
+            let Ok(stat) = prc.stat() else {
+                continue;
+            };
+            let cur_tics = get_cur_ticks();
+            let cur_pid_ticks = stat.utime + stat.stime;
+            let Some((last_ticks, last_pid_ticks)) =
+                ticks.insert(stat.pid, (cur_tics, cur_pid_ticks))
+            else {
+                continue;
+            };
+            pid_children.entry(stat.ppid).or_default().push(stat.pid);
+            let load = (cur_pid_ticks - last_pid_ticks) as f32 / (cur_tics - last_ticks) as f32;
+            loads.insert(stat.pid, load);
         }
-        *out_loads.write().await = get_cumulated(&pid_children, &loads);
-        tokio::time::sleep(Duration::from_millis(UPDATE_INTERVAL_MS)).await;
+        if !loads.is_empty() {
+            *out_loads.write().await = get_cumulated(&pid_children, &loads);
+        }
+        sleep(MEASURE_PERIOD).await;
     }
 }
 
