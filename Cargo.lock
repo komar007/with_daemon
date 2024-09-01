@@ -232,23 +232,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fire"
-version = "0.1.0"
-dependencies = [
- "daemonize",
- "env_logger",
- "fork",
- "futures",
- "itertools",
- "log",
- "num",
- "num-derive",
- "num-traits",
- "procfs",
- "tokio",
-]
-
-[[package]]
 name = "flate2"
 version = "1.0.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -617,6 +600,23 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-targets",
+]
+
+[[package]]
+name = "pidtree_mon"
+version = "0.1.0"
+dependencies = [
+ "daemonize",
+ "env_logger",
+ "fork",
+ "futures",
+ "itertools",
+ "log",
+ "num",
+ "num-derive",
+ "num-traits",
+ "procfs",
+ "tokio",
 ]
 
 [[package]]

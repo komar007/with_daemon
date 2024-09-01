@@ -24,8 +24,8 @@ extern crate num_derive;
 const UPDATE_INTERVAL: Duration = Duration::from_millis(1000);
 const DAEMON_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MEASURE_PERIOD: Duration = Duration::from_millis(100);
-const SOCKET_FILENAME: &str = "/tmp/fire.sock";
-const PID_FILENAME: &str = "/tmp/fire.pid";
+const SOCKET_FILENAME: &str = "/tmp/pidtree_mon.sock";
+const PID_FILENAME: &str = "/tmp/pidtree_mon.pid";
 
 fn main() -> Result<(), ()> {
     env_logger::init();
