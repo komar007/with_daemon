@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap, hash::Hash, io::Write, ops::Add, os::unix::net::UnixStream,
-    process::ExitCode, sync::Arc, time::Duration,
+    collections::HashMap, fmt::Display, hash::Hash, io::Write, ops::Add, os::unix::net::UnixStream,
+    process::ExitCode, str::FromStr, sync::Arc, time::Duration,
 };
 
 use clap::Parser;
@@ -119,16 +119,47 @@ async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
     pin!(loads_stream);
     let deadline = config.timeout.map(|tmout| Instant::now() + tmout);
     while let Some(loads) = loads_stream.next().await {
-        let sum: f32 = loads
-            .iter()
-            .map(|l| if l.is_nan() { 0.0 } else { *l })
-            .sum();
-        println!("{} {}", sum, loads.iter().format(" "));
+        println!("{}", OutputLine(&config.fields, loads));
         if deadline.is_some_and(|d| Instant::now() > d) {
             break;
         }
     }
     Ok(())
+}
+
+struct OutputLine<'f>(&'f Vec<Field>, Vec<f32>);
+
+impl<'f> Display for OutputLine<'f> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let OutputLine(spec, loads) = self;
+        let sum: f32 = loads
+            .iter()
+            .map(|l| if l.is_nan() { 0.0 } else { *l })
+            .sum();
+        let mut any_written = false;
+        for field in spec.iter() {
+            if any_written {
+                write!(f, " ")?;
+            }
+            match field {
+                Field::Sum => write!(f, "{sum}")?,
+                Field::AllLoads => write!(f, "{}", loads.iter().join(" "))?,
+                Field::IfGreater {
+                    value,
+                    then,
+                    otherwise,
+                } => {
+                    if sum > *value {
+                        write!(f, "{}", then)?
+                    } else if let Some(o) = otherwise {
+                        write!(f, "{}", o)?
+                    }
+                }
+            }
+            any_written = true;
+        }
+        Ok(())
+    }
 }
 
 #[derive(clap::Parser, Debug)]
@@ -138,6 +169,53 @@ struct Config {
     pids: Vec<i32>,
     #[arg(short, long, value_parser = parse_timeout_duration)]
     timeout: Option<Duration>,
+    #[arg(
+        name = "field",
+        short,
+        long,
+        help = "sum | all_loads | if_greater:value:then[:else]",
+        default_values = ["sum", "all_loads"]
+    )]
+    fields: Vec<Field>,
+}
+
+#[derive(Clone, Debug)]
+enum Field {
+    Sum,
+    AllLoads,
+    IfGreater {
+        value: f32,
+        then: String,
+        otherwise: Option<String>,
+    },
+}
+
+impl FromStr for Field {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut tokens = value.split(':');
+        let field = tokens.next().expect("should produce at least 1 elment");
+        match field {
+            "" => Err("missing field name")?,
+            "sum" => Ok(Field::Sum),
+            "all_loads" => Ok(Field::AllLoads),
+            "if_greater" => {
+                let value: f32 = tokens
+                    .next()
+                    .ok_or("missing value")?
+                    .parse()
+                    .map_err(|e| format!("wrong value: {e}"))?;
+                let then = tokens.next().ok_or("missing then-clause")?.to_owned();
+                let otherwise = tokens.next().map(|t| t.to_owned());
+                Ok(Field::IfGreater {
+                    value,
+                    then,
+                    otherwise,
+                })
+            }
+            _ => Err(format!("unknown field {field}"))?,
+        }
+    }
 }
 
 fn parse_timeout_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
