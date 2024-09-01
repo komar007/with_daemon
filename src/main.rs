@@ -1,7 +1,9 @@
 use std::{
-    collections::HashMap, env::args, hash::Hash, io::Write, ops::Add, os::unix::net::UnixStream,
-    sync::Arc, time::Duration,
+    collections::HashMap, hash::Hash, io::Write, ops::Add, os::unix::net::UnixStream,
+    process::ExitCode, sync::Arc, time::Duration,
 };
+
+use clap::Parser;
 
 use daemonize::Daemonize;
 use fork::Fork;
@@ -27,10 +29,23 @@ const MEASURE_PERIOD: Duration = Duration::from_millis(100);
 const SOCKET_FILENAME: &str = "/tmp/pidtree_mon.sock";
 const PID_FILENAME: &str = "/tmp/pidtree_mon.pid";
 
-fn main() -> Result<(), ()> {
+fn main() -> ExitCode {
+    match entrypoint() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            if let Some(e) = e {
+                error!("{e}");
+                println!("{e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn entrypoint() -> Result<(), Option<String>> {
     env_logger::init();
     let (mut stream_child, stream_parent) =
-        UnixStream::pair().map_err(|e| error!("could not create UnixStream pair: {e}"))?;
+        UnixStream::pair().map_err(|e| format!("could not create UnixStream pair: {e}"))?;
     match fork::fork() {
         Ok(Fork::Child) => {
             info!("child process");
@@ -39,12 +54,12 @@ fn main() -> Result<(), ()> {
             match daemonize.start() {
                 Ok(_) => {
                     info!("daemonized");
-                    run_daemon(stream_child).map_err(|e| error!("{}", e))
+                    run_daemon(stream_child)
                 }
                 Err(e) => {
                     stream_child
                         .write_all(&(ReadyToken::DaemonRunning as u32).to_be_bytes())
-                        .map_err(|e| error!("error writing to parent: {e}"))?;
+                        .map_err(|e| format!("error writing to parent: {e}"))?;
                     debug!("error deamonizing: {}, assuming daemon running", e);
                     Ok(())
                 }
@@ -52,13 +67,11 @@ fn main() -> Result<(), ()> {
         }
         Ok(Fork::Parent(_)) => {
             drop(stream_child);
-            run_client(stream_parent).map_err(|e| {
-                e.inspect(|e| error!("{}", e));
-            })
+            run_client(stream_parent)
         }
         Err(_) => {
             error!("couldn't fork");
-            Err(())
+            Err(None)
         }
     }
 }
@@ -78,16 +91,14 @@ async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
         num::FromPrimitive::from_u32(ready).expect("ready token should have known value");
     info!("parent ready, {:?}, starting client", ready);
     let mut stream = connect_to_daemon(ready).await?;
-    let pids: Result<Vec<i32>, _> = args().skip(1).map(|a| a.parse()).collect();
-    let pids = pids.map_err(|_| {
-        print_usage();
-        None
-    })?;
-    if pids.is_empty() {
-        print_usage();
-        return Err(None);
-    }
-    for pid in &pids {
+    let config = match Config::try_parse() {
+        Ok(config) => config,
+        Err(e) => {
+            e.print().map_err(|e| format!("error printing help: {e}"))?;
+            return Err(None);
+        }
+    };
+    for pid in &config.pids {
         stream
             .write_i32(*pid)
             .await
@@ -104,16 +115,34 @@ async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
     let loads_stream = unfold(stream, |mut stream| async {
         stream.read_f32().await.ok().map(|load| (load, stream))
     })
-    .chunks(pids.len());
+    .chunks(config.pids.len());
     pin!(loads_stream);
+    let deadline = config.timeout.map(|tmout| Instant::now() + tmout);
     while let Some(loads) = loads_stream.next().await {
         let sum: f32 = loads
             .iter()
             .map(|l| if l.is_nan() { 0.0 } else { *l })
             .sum();
-        println!("{} {}", sum, loads.iter().format(" "))
+        println!("{} {}", sum, loads.iter().format(" "));
+        if deadline.is_some_and(|d| Instant::now() > d) {
+            break;
+        }
     }
     Ok(())
+}
+
+#[derive(clap::Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Config {
+    #[arg(name = "pid", required = true, num_args = 1..)]
+    pids: Vec<i32>,
+    #[arg(short, long, value_parser = parse_timeout_duration)]
+    timeout: Option<Duration>,
+}
+
+fn parse_timeout_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
+    let seconds = arg.parse()?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 async fn connect_to_daemon(ready: ReadyToken) -> Result<TokioUnixStream, String> {
@@ -132,11 +161,6 @@ async fn connect_to_daemon(ready: ReadyToken) -> Result<TokioUnixStream, String>
     }
 }
 
-fn print_usage() {
-    let name = args().next().expect("args should have program name");
-    println!("usage:\n\t{name} pid [..pids]")
-}
-
 #[derive(Debug, FromPrimitive)]
 enum ReadyToken {
     DaemonForked = 0x4ea11e55,
@@ -144,7 +168,7 @@ enum ReadyToken {
 }
 
 #[tokio::main]
-async fn run_daemon(other_fork: UnixStream) -> Result<(), String> {
+async fn run_daemon(other_fork: UnixStream) -> Result<(), Option<String>> {
     other_fork
         .set_nonblocking(true)
         .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
