@@ -78,6 +78,7 @@ fn entrypoint() -> Result<(), Option<String>> {
 
 #[tokio::main]
 async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
+    let config = Config::parse();
     other_fork
         .set_nonblocking(true)
         .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
@@ -91,13 +92,6 @@ async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
         num::FromPrimitive::from_u32(ready).expect("ready token should have known value");
     info!("parent ready, {:?}, starting client", ready);
     let mut stream = connect_to_daemon(ready).await?;
-    let config = match Config::try_parse() {
-        Ok(config) => config,
-        Err(e) => {
-            e.print().map_err(|e| format!("error printing help: {e}"))?;
-            return Err(None);
-        }
-    };
     for pid in &config.pids {
         stream
             .write_i32(*pid)
