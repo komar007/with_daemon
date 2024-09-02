@@ -44,6 +44,7 @@ fn main() -> ExitCode {
 
 fn entrypoint() -> Result<(), Option<String>> {
     env_logger::init();
+    let config = Config::parse();
     let (mut stream_child, stream_parent) =
         UnixStream::pair().map_err(|e| format!("could not create UnixStream pair: {e}"))?;
     match fork::fork() {
@@ -67,7 +68,7 @@ fn entrypoint() -> Result<(), Option<String>> {
         }
         Ok(Fork::Parent(_)) => {
             drop(stream_child);
-            run_client(stream_parent)
+            run_client(config, stream_parent)
         }
         Err(_) => {
             error!("couldn't fork");
@@ -77,8 +78,7 @@ fn entrypoint() -> Result<(), Option<String>> {
 }
 
 #[tokio::main]
-async fn run_client(other_fork: UnixStream) -> Result<(), Option<String>> {
-    let config = Config::parse();
+async fn run_client(config: Config, other_fork: UnixStream) -> Result<(), Option<String>> {
     other_fork
         .set_nonblocking(true)
         .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
