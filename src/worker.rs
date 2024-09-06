@@ -1,93 +1,69 @@
 use std::{collections::HashMap, hash::Hash, ops::Add, sync::Arc, time::Duration};
 
-use futures::{never::Never, stream::unfold, StreamExt};
-use log::{error, info};
+use futures::{stream::unfold, StreamExt};
+use log::error;
 use procfs::{CurrentSI, KernelStats};
 use tokio::{
-    fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{UnixListener, UnixStream as TokioUnixStream},
-    sync::{
-        broadcast::{self},
-        oneshot,
-    },
+    net::UnixStream as TokioUnixStream,
+    sync::broadcast::{self},
     time::{sleep, sleep_until, Instant},
 };
 
 /// How long to wait between 2 measurements.
 const MEASURE_PERIOD: Duration = Duration::from_millis(100);
 
-/// Run the daemon indefinitely.
-///
-/// It is assumed that the process that spawns the daemon uses fork() and expects a trigger when
-/// the daemon is ready to accept connections. The integer value of [ReadyToken::DaemonForked] will
-/// be sent through `other_fork` when that happens.
-pub async fn run(
-    ready: oneshot::Sender<()>,
-    socket_filename: &str,
-    update_interval: Duration,
-) -> Result<Never, Option<String>> {
-    fs::remove_file(socket_filename)
-        .await
-        .map_err(|e| format!("could not remove old socket file: {e}"))?;
-    let listener =
-        UnixListener::bind(socket_filename).map_err(|e| format!("error creating socket: {e}"))?;
-    ready.send(()).expect("receiver should not be dropped");
-
-    let (loads, _) = broadcast::channel(1);
-    let sender = loads.clone();
-    tokio::spawn(async move {
-        loop {
-            let next = Instant::now() + update_interval;
-            measure_pid_loads(&sender).await;
-            sleep_until(next).await;
-        }
-    });
-    loop {
-        match listener.accept().await {
-            Ok((socket, addr)) => {
-                info!("accepted from {addr:?}");
-                tokio::spawn(serve_client(socket, loads.subscribe()));
-            }
-            Err(e) => error!("accept function failed: {:?}", e),
-        }
-    }
+pub struct Worker {
+    loads: broadcast::Sender<Arc<HashMap<i32, f32>>>,
 }
 
-async fn serve_client(
-    mut socket: TokioUnixStream,
-    mut loads: broadcast::Receiver<Arc<HashMap<i32, f32>>>,
-) {
-    let (reader, writer) = socket.split();
-    let reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
-    let pids: Vec<_> = unfold(reader, |mut reader| async {
-        reader.read_i32().await.ok().map(|pid| (pid, reader))
-    })
-    .collect()
-    .await;
-    'serving: loop {
-        let pid_loads: Vec<_> = {
-            let Ok(loads) = loads.recv().await else {
-                continue 'serving;
+impl Worker {
+    pub async fn new(update_interval: Duration) -> Self {
+        let (loads, _) = broadcast::channel(1);
+        let sender = loads.clone();
+        tokio::spawn(async move {
+            loop {
+                let next = Instant::now() + update_interval;
+                measure_pid_loads(&sender).await;
+                sleep_until(next).await;
+            }
+        });
+        Self { loads }
+    }
+
+    pub async fn handle_client(self: Arc<Self>, mut stream: TokioUnixStream) {
+        let mut loads = self.loads.subscribe();
+        let (reader, writer) = stream.split();
+        let reader = BufReader::new(reader);
+        let mut writer = BufWriter::new(writer);
+        let pids: Vec<_> = unfold(reader, |mut reader| async {
+            reader.read_i32().await.ok().map(|pid| (pid, reader))
+        })
+        .collect()
+        .await;
+        'serving: loop {
+            let pid_loads: Vec<_> = {
+                let Ok(loads) = loads.recv().await else {
+                    continue 'serving;
+                };
+                pids.iter()
+                    .map(|pid| *loads.get(pid).unwrap_or(&f32::NAN))
+                    .collect()
             };
-            pids.iter()
-                .map(|pid| *loads.get(pid).unwrap_or(&f32::NAN))
-                .collect()
-        };
-        for pid in pid_loads {
-            if let Err(e) = writer.write_f32(pid).await {
-                error!("error writing response: {e}");
+            for pid in pid_loads {
+                if let Err(e) = writer.write_f32(pid).await {
+                    error!("error writing response: {e}");
+                    break 'serving;
+                }
+            }
+            if let Err(e) = writer.flush().await {
+                error!("error flushing stream: {e}");
                 break 'serving;
             }
         }
-        if let Err(e) = writer.flush().await {
-            error!("error flushing stream: {e}");
-            break 'serving;
+        if let Err(e) = stream.shutdown().await {
+            error!("error shutting down: {e}");
         }
-    }
-    if let Err(e) = socket.shutdown().await {
-        error!("error shutting down: {e}");
     }
 }
 
