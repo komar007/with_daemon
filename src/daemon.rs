@@ -1,20 +1,18 @@
-use std::{
-    collections::HashMap, hash::Hash, ops::Add, os::unix::net::UnixStream, sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, hash::Hash, ops::Add, sync::Arc, time::Duration};
 
-use futures::{stream::unfold, StreamExt};
+use futures::{never::Never, stream::unfold, StreamExt};
 use log::{error, info};
 use procfs::{CurrentSI, KernelStats};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{UnixListener, UnixStream as TokioUnixStream},
-    sync::broadcast::{self, Sender},
+    sync::{
+        broadcast::{self},
+        oneshot,
+    },
     time::{sleep, sleep_until, Instant},
 };
-
-use crate::protocol::ReadyToken;
 
 /// How long to wait between 2 measurements.
 const MEASURE_PERIOD: Duration = Duration::from_millis(100);
@@ -24,25 +22,17 @@ const MEASURE_PERIOD: Duration = Duration::from_millis(100);
 /// It is assumed that the process that spawns the daemon uses fork() and expects a trigger when
 /// the daemon is ready to accept connections. The integer value of [ReadyToken::DaemonForked] will
 /// be sent through `other_fork` when that happens.
-#[tokio::main]
 pub async fn run(
-    other_fork: UnixStream,
+    ready: oneshot::Sender<()>,
     socket_filename: &str,
     update_interval: Duration,
-) -> Result<(), Option<String>> {
-    other_fork
-        .set_nonblocking(true)
-        .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
-    let mut other_fork = TokioUnixStream::from_std(other_fork)
-        .map_err(|e| format!("error tokioing UnixStream to fork: {e}"))?;
-    let _ = fs::remove_file(socket_filename).await;
+) -> Result<Never, Option<String>> {
+    fs::remove_file(socket_filename)
+        .await
+        .map_err(|e| format!("could not remove old socket file: {e}"))?;
     let listener =
         UnixListener::bind(socket_filename).map_err(|e| format!("error creating socket: {e}"))?;
-
-    other_fork
-        .write_u32(ReadyToken::DaemonForked as u32)
-        .await
-        .map_err(|e| format!("error reading from fork parent: {e}"))?;
+    ready.send(()).expect("receiver should not be dropped");
 
     let (loads, _) = broadcast::channel(1);
     let sender = loads.clone();
@@ -101,7 +91,7 @@ async fn serve_client(
     }
 }
 
-async fn measure_pid_loads(out_loads: &Sender<Arc<HashMap<i32, f32>>>) {
+async fn measure_pid_loads(out_loads: &broadcast::Sender<Arc<HashMap<i32, f32>>>) {
     let mut ticks = HashMap::new();
     for _ in 0..2 {
         let mut pid_children: HashMap<_, Vec<_>> = Default::default();

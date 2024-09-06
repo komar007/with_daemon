@@ -4,7 +4,16 @@ use clap::Parser as _;
 use config::Config;
 use daemonize::Daemonize;
 use fork::Fork;
+use futures::{
+    future::{self, Either},
+    never::Never,
+};
 use log::{debug, error, info};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::UnixStream as TokioUnixStream,
+    sync::oneshot,
+};
 
 use crate::protocol::ReadyToken;
 
@@ -43,16 +52,16 @@ fn entrypoint() -> Result<(), Option<String>> {
             match daemonize.start() {
                 Ok(_) => {
                     info!("daemonized");
-                    daemon::run(stream_child, SOCKET_FILENAME, UPDATE_INTERVAL)
+                    run_daemon(stream_child)?;
                 }
                 Err(e) => {
                     stream_child
                         .write_all(&(ReadyToken::DaemonRunning as u32).to_be_bytes())
                         .map_err(|e| format!("error writing to parent: {e}"))?;
                     debug!("error deamonizing: {}, assuming daemon running", e);
-                    Ok(())
                 }
             }
+            Ok(())
         }
         Ok(Fork::Parent(_)) => {
             drop(stream_child);
@@ -60,11 +69,63 @@ fn entrypoint() -> Result<(), Option<String>> {
                 app: config,
                 socket_filename: SOCKET_FILENAME.into(),
             };
-            client::run(cconfig, stream_parent)
+            run_client(cconfig, stream_parent)
         }
         Err(_) => {
             error!("couldn't fork");
             Err(None)
         }
     }
+}
+
+#[tokio::main]
+async fn run_daemon(child_stream: UnixStream) -> Result<Never, Option<String>> {
+    child_stream
+        .set_nonblocking(true)
+        .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
+    let mut child_stream = TokioUnixStream::from_std(child_stream)
+        .map_err(|e| format!("error tokioing UnixStream to fork: {e}"))?;
+
+    let (ready_tx, ready) = oneshot::channel();
+    let ready_notifier = tokio::spawn(async move {
+        let token = if let Ok(()) = ready.await {
+            ReadyToken::DaemonForked
+        } else {
+            ReadyToken::DeamonFailed
+        };
+        child_stream
+            .write_u32(token as u32)
+            .await
+            .map_err(|e| Some(format!("error writing to fork parent: {e}")))
+    });
+
+    let daemon = tokio::spawn(daemon::run(ready_tx, SOCKET_FILENAME, UPDATE_INTERVAL));
+
+    match future::select(ready_notifier, daemon).await {
+        Either::Left((notifier, daemon)) => {
+            notifier.expect("notifier task should not panic")?;
+            daemon.await.expect("daemon task should not panic")
+        }
+        Either::Right((daemon, _)) => daemon.expect("daemon task should not panic"),
+    }
+}
+
+#[tokio::main]
+async fn run_client(
+    config: client::Config,
+    parent_stream: UnixStream,
+) -> Result<(), Option<String>> {
+    parent_stream
+        .set_nonblocking(true)
+        .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
+    let mut parent_stream = TokioUnixStream::from_std(parent_stream)
+        .map_err(|e| format!("error tokioing UnixStream to fork: {e}"))?;
+    let ready = parent_stream
+        .read_u32()
+        .await
+        .map_err(|e| format!("error reading from fork parent: {e}"))?;
+    let ready: ReadyToken =
+        num::FromPrimitive::from_u32(ready).expect("ready token should have known value");
+    info!("parent ready, {:?}, starting client", ready);
+    client::run(config, ready).await
 }

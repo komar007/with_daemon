@@ -1,4 +1,4 @@
-use std::{fmt::Display, os::unix::net::UnixStream, time::Duration};
+use std::{fmt::Display, time::Duration};
 
 use futures::{stream::unfold, StreamExt as _};
 use itertools::Itertools as _;
@@ -21,20 +21,7 @@ pub struct Config {
 }
 
 /// Run the client for as long as configured.
-#[tokio::main]
-pub async fn run(config: Config, other_fork: UnixStream) -> Result<(), Option<String>> {
-    other_fork
-        .set_nonblocking(true)
-        .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
-    let mut other_fork = TokioUnixStream::from_std(other_fork)
-        .map_err(|e| format!("error tokioing UnixStream to fork: {e}"))?;
-    let ready = other_fork
-        .read_u32()
-        .await
-        .map_err(|e| format!("error reading from fork parent: {e}"))?;
-    let ready: ReadyToken =
-        num::FromPrimitive::from_u32(ready).expect("ready token should have known value");
-    info!("parent ready, {:?}, starting client", ready);
+pub async fn run(config: Config, ready: ReadyToken) -> Result<(), Option<String>> {
     let mut stream = connect_to_daemon(ready, &config.socket_filename).await?;
     for pid in &config.app.pids {
         stream
@@ -104,10 +91,15 @@ async fn connect_to_daemon(
     ready: ReadyToken,
     socket_filename: &str,
 ) -> Result<TokioUnixStream, String> {
+    if ready == ReadyToken::DeamonFailed {
+        Err("daemon failed to start".to_string())?
+    }
     match TokioUnixStream::connect(socket_filename).await {
         Ok(stream) => Ok(stream),
         Err(e) => match ready {
-            ReadyToken::DaemonForked => Err(format!("could not communicate with daemon: {e}")),
+            ReadyToken::DaemonForked => Err(format!(
+                "could not communicate with just spawned daemon: {e}"
+            )),
             ReadyToken::DaemonRunning => {
                 info!("daemon running, but not ready, retrying");
                 tokio::time::sleep(DAEMON_RETRY_DELAY).await;
@@ -115,6 +107,7 @@ async fn connect_to_daemon(
                     .await
                     .map_err(|e| format!("could not communicate with daemon after retry: {e}"))
             }
+            ReadyToken::DeamonFailed => panic!("deamon cannot have failed at this point"),
         },
     }
 }
