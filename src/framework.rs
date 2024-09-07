@@ -13,7 +13,38 @@ use tokio::{
     sync::oneshot,
 };
 
-pub fn run<S, IFut, H, HFut, R, C, CFut>(
+/// Run and await an async function that requires communication with a daemon, abstracting away
+/// daemon creation and some communication logic.
+///
+/// The function that requires communication with a daemon is referred to as the client. It
+/// receives a bi-directional async stream that is directly connected to one instance of the
+/// daemon's client handler.
+///
+/// The client is awaited in the current process and may exchange information with the handler
+/// using the provided stream to take advantage of the common state available to all instances of
+/// the handler.
+///
+/// The handler is spawned on the daemon process for each client and is given the shared state and
+/// a bi-directional stream whose other end is connected to the client. Multiple handlers are
+/// awaited in separate async tasks, running in parallel.
+///
+/// The common state is produced by awaiting the `init` future in the daemon process and remains in
+/// existence throughout the life of the daemon process.
+///
+/// The daemon process is spawned when necessary (i.e. when it is not detected as running) and
+/// is kept running forever for further clients to connect to it and take advantage of its state.
+///
+/// # Arguments
+///
+/// * `pid_filename` - the name of the PID file
+/// * `socket_filename` - the name of the UNIX socket file for communication with the daemon
+/// * `init` - a future which resolves to the state shared between client handlers on the daemon
+///   side
+/// * `handler` - a function spawned for each client that connects to the daemon; it can use the
+///   shared state and communicate with its client using a stream
+/// * `client` - a function that implements the daemon's client instance by communicating with the
+///   daemon
+pub fn with_daemon<S, IFut, H, HFut, R, C, CFut>(
     pid_filename: &str,
     socket_filename: &str,
     init: IFut,
@@ -47,7 +78,7 @@ where
                     stream_child
                         .write_all(&(ReadyToken::DaemonRunning as u32).to_be_bytes())
                         .map_err(|e| format!("error writing to parent: {e}"))?;
-                    debug!("error deamonizing: {}, assuming daemon running", e);
+                    debug!("error daemonizing: {}, assuming daemon running", e);
                 }
             }
             Ok(None)
