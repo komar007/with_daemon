@@ -1,18 +1,27 @@
 [package]
-name = "pidtree_mon"
+name = "with_daemon"
+description = "An async client-daemon abstraction framework"
+authors = ["Michał Trybus <komar007@gmail.com>"]
+license = "MIT"
+
+repository = "https://github.com/komar007/with_daemon"
+readme = "README.md"
+documentation = "https://docs.rs/with_daemon"
+
+categories = ["concurrency", "network-programming", "asynchronous", "caching"]
+keywords = ["daemon", "daemonize", "unix", "async"]
+
 version = "0.1.0"
 edition = "2021"
 
+publish = false
+
 [dependencies]
-tokio = { version = "1.39", features = ["full"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "fs", "sync"] }
 log = "0.4"
-env_logger = "0.11"
-procfs = "0.16"
 fork = "0.2"
 daemonize = "0.5"
 num = "0.4"
 num-derive = "0.4"
 num-traits = "0.2"
 futures = "0.3"
-itertools = "0.13"
-clap = { version = "4.5", features = [ "derive" ] }

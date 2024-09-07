@@ -9,7 +9,7 @@ jobs:
   release:
     name: Release Packaging
     env:
-      PROJECT_NAME_UNDERSCORE: pidtree_mon
+      PROJECT_NAME_UNDERSCORE: with_daemon
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
@@ -19,7 +19,7 @@ jobs:
           toolchain: stable
           override: true
       - name: Release Build
-        run: cargo build --release --locked
+        run: cargo build --release
       - name: 'Upload Artifact'
         uses: actions/upload-artifact@v2
         with:
