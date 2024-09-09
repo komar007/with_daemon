@@ -1,6 +1,6 @@
 use std::{future::Future, io::Write, os::unix::net::UnixStream, sync::Arc, time::Duration};
 
-use daemonize::Daemonize;
+use daemonize::{Daemonize, Stdio};
 use fork::Fork;
 use futures::{
     future::{self, Either},
@@ -65,7 +65,10 @@ where
         Ok(Fork::Child) => {
             info!("child process");
             drop(stream_parent);
-            let daemonize = Daemonize::new().pid_file(pid_filename);
+            let daemonize = Daemonize::new()
+                .pid_file(pid_filename)
+                .stderr(Stdio::keep())
+                .stdout(Stdio::keep());
             match daemonize.start() {
                 Ok(_) => {
                     info!("daemonized");
@@ -158,6 +161,7 @@ where
     }
 }
 
+/// Run the client for as long as needed
 #[tokio::main]
 async fn run_client<R, C, CFut>(
     socket_filename: &str,
