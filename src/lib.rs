@@ -8,6 +8,7 @@ use futures::{
 };
 use log::{debug, error, info};
 use tokio::{
+    fs,
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{UnixListener, UnixStream as TokioUnixStream},
     sync::oneshot,
@@ -132,9 +133,14 @@ where
 
     let socket_filename = socket_filename.to_owned();
     let daemon = tokio::spawn(async move {
-        tokio::fs::remove_file(&socket_filename)
+        if fs::try_exists(&socket_filename)
             .await
-            .map_err(|e| format!("could not remove old socket file: {e}"))?;
+            .map_err(|e| format!("could not use file {socket_filename} as socket: {e}"))?
+        {
+            fs::remove_file(&socket_filename)
+                .await
+                .map_err(|e| format!("could not remove old socket file: {e}"))?;
+        }
         let listener = UnixListener::bind(socket_filename)
             .map_err(|e| format!("error creating socket: {e}"))?;
         ready_tx.send(()).expect("receiver should not be dropped");
