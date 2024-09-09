@@ -80,7 +80,7 @@ where
                 }
                 Err(e) => {
                     stream_child
-                        .write_all(&(ReadyToken::DaemonRunning as u32).to_be_bytes())
+                        .write_all(&(DaemonReadyToken::Running as u32).to_be_bytes())
                         .map_err(|e| format!("error writing to parent: {e}"))?;
                     debug!("error daemonizing: {}, assuming daemon running", e);
                 }
@@ -121,9 +121,9 @@ where
     let (ready_tx, ready) = oneshot::channel();
     let ready_notifier = tokio::spawn(async move {
         let token = if let Ok(()) = ready.await {
-            ReadyToken::DaemonForked
+            DaemonReadyToken::Forked
         } else {
-            ReadyToken::DeamonFailed
+            DaemonReadyToken::Failed
         };
         child
             .write_u32(token as u32)
@@ -184,7 +184,7 @@ where
         .read_u32()
         .await
         .map_err(|e| format!("error reading from fork parent: {e}"))?;
-    let ready: ReadyToken =
+    let ready: DaemonReadyToken =
         num::FromPrimitive::from_u32(ready).expect("ready token should have known value");
     let stream = connect_to_daemon(ready, socket_filename).await?;
     info!("parent ready, {:?}, starting client", ready);
@@ -192,26 +192,26 @@ where
 }
 
 async fn connect_to_daemon(
-    ready: ReadyToken,
+    ready: DaemonReadyToken,
     socket_filename: &str,
 ) -> Result<TokioUnixStream, String> {
-    if ready == ReadyToken::DeamonFailed {
+    if ready == DaemonReadyToken::Failed {
         Err("daemon failed to start".to_string())?
     }
     match TokioUnixStream::connect(socket_filename).await {
         Ok(stream) => Ok(stream),
         Err(e) => match ready {
-            ReadyToken::DaemonForked => Err(format!(
+            DaemonReadyToken::Forked => Err(format!(
                 "could not communicate with just spawned daemon: {e}"
             )),
-            ReadyToken::DaemonRunning => {
+            DaemonReadyToken::Running => {
                 info!("daemon running, but not ready, retrying");
                 tokio::time::sleep(DAEMON_CONNECTION_RETRY_DELAY).await;
                 TokioUnixStream::connect(socket_filename)
                     .await
                     .map_err(|e| format!("could not communicate with daemon after retry: {e}"))
             }
-            ReadyToken::DeamonFailed => panic!("deamon cannot have failed at this point"),
+            DaemonReadyToken::Failed => panic!("daemon cannot have failed at this point"),
         },
     }
 }
@@ -219,14 +219,14 @@ async fn connect_to_daemon(
 /// A type to send through a socket between fork()'s parent and child to inform the parent about
 /// the status of the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_derive::FromPrimitive)]
-enum ReadyToken {
+enum DaemonReadyToken {
     /// Daemon has just been forked by the child and is now ready to accept connections.
-    DaemonForked = 0x4ea11e55,
+    Forked = 0x4ea11e55,
     /// Daemon has already been running and it is not known if it is ready to accept connections
     /// (but very likely it is).
-    DaemonRunning = 0x4ea1ab1e,
-    /// Deamon could not be run.
-    DeamonFailed = 0x5000dead,
+    Running = 0x4ea1ab1e,
+    /// Daemon could not be run.
+    Failed = 0x5000dead,
 }
 
 const DAEMON_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(10);
