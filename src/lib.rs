@@ -51,7 +51,7 @@ pub fn with_daemon<S, IFut, H, HFut, R, C, CFut>(
     init: IFut,
     handler: H,
     client: C,
-) -> Result<Option<R>, String>
+) -> Result<R, String>
 where
     IFut: Future<Output = S> + Send + 'static,
     S: Send + Sync + 'static,
@@ -85,14 +85,14 @@ where
                     debug!("error daemonizing: {}, assuming daemon running", e);
                 }
             }
-            Ok(None)
+            std::process::exit(0)
         }
         Ok(Fork::Parent(_)) => {
             drop(stream_child);
             stream_parent
                 .set_nonblocking(true)
                 .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
-            run_client(socket_filename, client, stream_parent).map(Some)
+            run_client(socket_filename, client, stream_parent)
         }
         Err(_) => {
             error!("couldn't fork");
