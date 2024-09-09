@@ -23,6 +23,10 @@
 - Added README
 - Added changelog
 
+### ⚙️ Miscellaneous Tasks
+
+- Added crates-publish action
+
 ### PoC
 
 - Client timeout + introduced clap for arg parsing
