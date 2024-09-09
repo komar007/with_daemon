@@ -2,7 +2,7 @@
 name = "with_daemon"
 description = "An async client-daemon abstraction framework"
 authors = ["Michał Trybus <komar007@gmail.com>"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 repository = "https://github.com/komar007/with_daemon"
 readme = "README.md"
