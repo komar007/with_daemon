@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 /// Handle one client by retrieving a URL or using cached result.
 ///
-/// This functions reads the URL to retrieve, then looks it up in memory cache, making sure to
+/// This function reads the URL to retrieve, then looks it up in memory cache, making sure to
 /// release the global cache lock as soon as either entry is found or created if it didn't exist
 /// and lock the entry before releasing the global cache.
 ///

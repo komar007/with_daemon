@@ -57,8 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?; // An error above signifies an internal error in `with_daemon`, for example inability to fork,
         // so in the example we just fail when that happens.
 
-    // `result` here is just what our client closure returns, so an I/O error reading from the
-    // stream od the value read.
+    // `result` here is just what our client closure returns, so an I/O error reading from stream.
     println!("result: {}", result?);
     Ok(())
 }
