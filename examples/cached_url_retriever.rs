@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "/tmp/with_daemon__example_cached_url_retriever.pid",
         "/tmp/with_daemon__example_cached_url_retriever.sock",
         // shared state factory, awaited in the daemon process
-        async { State::default() },
+        |_| async { State::default() },
         // handler running in the daemon process, wrapped with a closure for ease of using `?`
         |state, stream| async move {
             if let Err(e) = handler(state, stream).await {
