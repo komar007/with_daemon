@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         //
         // `with_daemon` expects a future that resolves to the initial value of the state here.
         // It awaits that future in the daemon process and passes it to each handler.
-        async { AtomicU32::new(0) },
+        |_| async { AtomicU32::new(0) },
         // The handler is given an `Arc` holding the state above and a stream connected
         // bi-directionally to the client it is handling.
         //

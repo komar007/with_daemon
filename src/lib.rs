@@ -2,16 +2,17 @@ use std::{future::Future, io::Write, os::unix::net::UnixStream, sync::Arc, time:
 
 use daemonize::{Daemonize, Stdio};
 use fork::Fork;
-use futures::{
-    future::{self, Either},
-    never::Never,
-};
+use futures::future::{self, Either};
 use log::{debug, error, info};
 use tokio::{
     fs,
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{UnixListener, UnixStream as TokioUnixStream},
-    sync::oneshot,
+    select,
+    sync::{
+        mpsc::{self, Sender},
+        oneshot,
+    },
 };
 
 /// Run and await an async function that requires communication with a daemon, abstracting away
@@ -29,8 +30,8 @@ use tokio::{
 /// a bi-directional stream whose other end is connected to the client. Multiple handlers are
 /// awaited in separate async tasks, running in parallel.
 ///
-/// The common state is produced by awaiting the `init` future in the daemon process and remains in
-/// existence throughout the life of the daemon process.
+/// The common state is produced by awaiting the `init` function in the daemon process and remains
+/// in existence throughout the life of the daemon process.
 ///
 /// The daemon process is spawned when necessary (i.e. when it is not detected as running) and
 /// is kept running forever for further clients to connect to it and take advantage of its state.
@@ -39,21 +40,22 @@ use tokio::{
 ///
 /// * `pid_filename` - the name of the PID file
 /// * `socket_filename` - the name of the UNIX socket file for communication with the daemon
-/// * `init` - a future which resolves to the state shared between client handlers on the daemon
-///   side
+/// * `init` - a async function which returns the state shared between client handlers on the daemon
+///   side; it is given a control handle as an argument that can be used to request daemon shutdown
 /// * `handler` - a function spawned for each client that connects to the daemon; it can use the
 ///   shared state and communicate with its client using a stream
 /// * `client` - a function that implements the daemon's client instance by communicating with the
 ///   daemon
-pub fn with_daemon<S, IFut, H, HFut, R, C, CFut>(
+pub fn with_daemon<S, I, IFut, H, HFut, R, C, CFut>(
     pid_filename: &str,
     socket_filename: &str,
-    init: IFut,
+    init: I,
     handler: H,
     client: C,
 ) -> Result<R, String>
 where
-    IFut: Future<Output = S> + Send + 'static,
+    I: FnOnce(DaemonControl) -> IFut + Send + 'static,
+    IFut: Future<Output = S> + Send,
     S: Send + Sync + 'static,
     H: Fn(Arc<S>, TokioUnixStream) -> HFut + Send + 'static,
     HFut: Future<Output = ()> + Send + 'static,
@@ -64,7 +66,7 @@ where
         UnixStream::pair().map_err(|e| format!("could not create UnixStream pair: {e}"))?;
     match fork::fork() {
         Ok(Fork::Child) => {
-            info!("child process");
+            debug!("in child process");
             drop(stream_parent);
             let daemonize = Daemonize::new()
                 .pid_file(pid_filename)
@@ -88,6 +90,7 @@ where
             std::process::exit(0)
         }
         Ok(Fork::Parent(_)) => {
+            debug!("in parent process");
             drop(stream_child);
             stream_parent
                 .set_nonblocking(true)
@@ -101,16 +104,34 @@ where
     }
 }
 
+/// A handle to control the daemon.
+pub struct DaemonControl(Sender<DaemonControlMessage>);
+
+impl DaemonControl {
+    /// Request daemon shutdown.
+    ///
+    /// Calling this function asynchronously requests daemon shutdown. This will eventually
+    /// cause the daemon process to exit.
+    pub async fn shutdown(&self) {
+        let _ = self.0.send(DaemonControlMessage::Shutdown).await;
+    }
+}
+
+enum DaemonControlMessage {
+    Shutdown,
+}
+
 /// Run the daemon indefinitely.
 #[tokio::main]
-async fn run_daemon<S, IFut, H, HFut>(
+async fn run_daemon<S, I, IFut, H, HFut>(
     socket_filename: &str,
-    init: IFut,
+    init: I,
     child: UnixStream,
     handler: H,
-) -> Result<Never, String>
+) -> Result<(), String>
 where
-    IFut: Future<Output = S> + Send + 'static,
+    I: FnOnce(DaemonControl) -> IFut + Send + 'static,
+    IFut: Future<Output = S> + Send,
     S: Send + Sync + 'static,
     H: Fn(Arc<S>, TokioUnixStream) -> HFut + Send + 'static,
     HFut: Future<Output = ()> + Send + 'static,
@@ -132,11 +153,13 @@ where
     });
 
     let socket_filename = socket_filename.to_owned();
+    let (sender, mut control_receiver) = mpsc::channel(1);
     let daemon = tokio::spawn(async move {
         if fs::try_exists(&socket_filename)
             .await
             .map_err(|e| format!("could not use file {socket_filename} as socket: {e}"))?
         {
+            debug!("attempting to remove old socket file");
             fs::remove_file(&socket_filename)
                 .await
                 .map_err(|e| format!("could not remove old socket file: {e}"))?;
@@ -144,18 +167,26 @@ where
         let listener = UnixListener::bind(socket_filename)
             .map_err(|e| format!("error creating socket: {e}"))?;
         ready_tx.send(()).expect("receiver should not be dropped");
+        debug!("notified socket ready");
 
-        let state = Arc::new(init.await);
+        let ctrl = DaemonControl(sender);
+        let state = Arc::new(init(ctrl).await);
+        debug!("started main loop");
         loop {
-            match listener.accept().await {
+            match select! { biased;
+                Some(DaemonControlMessage::Shutdown) = control_receiver.recv() => { break },
+                a = listener.accept() => a,
+            } {
                 Ok((socket, addr)) => {
-                    info!("accepted from {addr:?}");
+                    info!("accepted from {addr:?}, spawning handler");
                     let state = Arc::clone(&state);
                     tokio::spawn(handler(state, socket));
                 }
                 Err(e) => error!("accept function failed: {:?}", e),
             }
         }
+        info!("daemon requested shutdown");
+        Ok(())
     });
 
     match future::select(ready_notifier, daemon).await {
