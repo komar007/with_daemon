@@ -1,5 +1,23 @@
 # Changelog of `with_daemon`
 
+## [0.2.0] - 2024-09-14
+
+### 🚀 Features
+
+- [**breaking**] Basic daemon control with shutdown capability
+- [**breaking**] Meaningful error result instead of string
+- Removed unneeded deps
+
+### 📚 Documentation
+
+- Fixed 2 typos
+- Updated example
+
+### ⚙️ Miscellaneous Tasks
+
+- Added release build to PR checks
+- Updated upload-artifact from v2 to v4
+
 ## [0.1.0] - 2024-09-09
 
 ### 🚀 Features
