@@ -1,12 +1,14 @@
-use std::{future::Future, io::Write, os::unix::net::UnixStream, sync::Arc, time::Duration};
+use std::{
+    fmt::Display, future::Future, io::Cursor, os::unix::net::UnixStream, sync::Arc, time::Duration,
+};
 
 use daemonize::{Daemonize, Stdio};
 use fork::Fork;
-use futures::future::{self, Either};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+use thiserror::Error as ThisError;
 use tokio::{
     fs,
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream as TokioUnixStream},
     select,
     sync::{
@@ -14,6 +16,8 @@ use tokio::{
         oneshot,
     },
 };
+
+mod wait_token;
 
 /// Run and await an async function that requires communication with a daemon, abstracting away
 /// daemon creation and some communication logic.
@@ -46,66 +50,134 @@ use tokio::{
 ///   shared state and communicate with its client using a stream
 /// * `client` - a function that implements the daemon's client instance by communicating with the
 ///   daemon
-pub fn with_daemon<S, I, IFut, H, HFut, R, C, CFut>(
+pub fn with_daemon<S, SE, I, IFut, H, HFut, R, C, CFut>(
     pid_filename: &str,
     socket_filename: &str,
     init: I,
     handler: H,
     client: C,
-) -> Result<R, String>
+) -> Result<R, Error>
 where
     I: FnOnce(DaemonControl) -> IFut + Send + 'static,
-    IFut: Future<Output = S> + Send,
+    IFut: Future<Output = Result<S, SE>> + Send,
     S: Send + Sync + 'static,
+    SE: Send + std::fmt::Debug + Display + 'static,
     H: Fn(Arc<S>, TokioUnixStream) -> HFut + Send + 'static,
     HFut: Future<Output = ()> + Send + 'static,
     C: FnOnce(TokioUnixStream) -> CFut,
     CFut: Future<Output = R>,
 {
-    let (mut stream_child, stream_parent) =
-        UnixStream::pair().map_err(|e| format!("could not create UnixStream pair: {e}"))?;
-    match fork::fork() {
-        Ok(Fork::Child) => {
+    let (child_stream, parent_stream) = UnixStream::pair()
+        .inspect_err(|e| error!("could not create UnixStream pair: {e}"))
+        .map_err(|_| Error::FatalIO)?;
+    parent_stream
+        .set_nonblocking(true)
+        .inspect_err(|e| error!("could not set UnixStream nonblocking: {e}"))
+        .map_err(|_| Error::FatalIO)?;
+    match fork::fork()
+        .inspect_err(|e| error!("couldn't fork: {e}"))
+        .map_err(|_| Error::FatalFork)?
+    {
+        Fork::Child => {
             debug!("in child process");
-            drop(stream_parent);
-            let daemonize = Daemonize::new()
-                .pid_file(pid_filename)
-                .stderr(Stdio::keep())
-                .stdout(Stdio::keep());
-            match daemonize.start() {
-                Ok(_) => {
-                    info!("daemonized");
-                    stream_child
-                        .set_nonblocking(true)
-                        .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
-                    run_daemon(socket_filename, init, stream_child, handler)?;
-                }
-                Err(e) => {
-                    stream_child
-                        .write_all(&(DaemonReadyToken::Running as u32).to_be_bytes())
-                        .map_err(|e| format!("error writing to parent: {e}"))?;
-                    debug!("error daemonizing: {}, assuming daemon running", e);
-                }
+            drop(parent_stream);
+            if do_child(pid_filename, socket_filename, child_stream, init, handler).is_err() {
+                error!("daemon failed");
             }
             std::process::exit(0)
         }
-        Ok(Fork::Parent(_)) => {
+        Fork::Parent(_) => {
             debug!("in parent process");
-            drop(stream_child);
-            stream_parent
-                .set_nonblocking(true)
-                .map_err(|e| format!("could not set UnixStream nonblocking: {e}"))?;
-            run_client(socket_filename, client, stream_parent)
-        }
-        Err(_) => {
-            error!("couldn't fork");
-            Err("error fork()ing".to_owned())
+            drop(child_stream);
+            run_client(socket_filename, client, parent_stream)
         }
     }
 }
 
 /// A handle to control the daemon.
 pub struct DaemonControl(Sender<DaemonControlMessage>);
+
+/// The error returned from [`with_daemon`].
+#[derive(ThisError, Debug)]
+pub enum Error {
+    /// Could not perform basic I/O before any daemon detection/spawning. This is a fatal error.
+    #[error("fatal I/O error")]
+    FatalIO,
+    /// Could not fork, this is a fatal error.
+    #[error("fork() error")]
+    FatalFork,
+    /// The status of the daemon could not be determined because of a fatal error.
+    #[error("cannot determine spawned daemon status")]
+    DaemonStatusUnknown,
+    /// Daemon failed to start.
+    ///
+    /// The daemon was not running so it was spawned and failed for an unknown reason.
+    #[error("daemon failed to start")]
+    DaemonFailed,
+    /// Daemon failed to start.
+    ///
+    /// The daemon was not running so it was spawned but failed to produce initial state.
+    /// This is a result of the `init` argument to [`with_daemon`] producing an error.
+    ///
+    /// The error from `init` is stored here as a string.
+    #[error("daemon failed to start")]
+    StateFailed(String),
+    /// Could not connect to a running daemon.
+    ///
+    /// An I/O error occured.
+    #[error("could not connect to daemon: {0}")]
+    ConnectionError(std::io::Error),
+}
+
+/// Implementation of the child process.
+///
+/// This process either spawns the daemon or assumes it is already spawned on [`daemonize`] error.
+/// If the daemon has already been running, [`DaemonReadyToken::Running`] is sent down the socket
+/// pair. Otherwise, one side of the socket is inherited by the forked daemon which sends one of
+/// the other possible variants back to the spawning client.
+fn do_child<S, SE, I, IFut, H, HFut>(
+    pid_filename: &str,
+    socket_filename: &str,
+    parent: UnixStream,
+    init: I,
+    handler: H,
+) -> Result<(), ()>
+where
+    I: FnOnce(DaemonControl) -> IFut + Send + 'static,
+    IFut: Future<Output = Result<S, SE>> + Send,
+    S: Send + Sync + 'static,
+    SE: Send + std::fmt::Debug + Display + 'static,
+    H: Fn(Arc<S>, TokioUnixStream) -> HFut + Send + 'static,
+    HFut: Future<Output = ()> + Send + 'static,
+{
+    let daemonize = Daemonize::new()
+        .pid_file(pid_filename)
+        .stderr(Stdio::keep())
+        .stdout(Stdio::keep());
+    parent
+        .set_nonblocking(true)
+        .map_err(|e| error!("could not set UnixStream nonblocking: {e}"))?;
+    match daemonize.start() {
+        Ok(_) => {
+            info!("daemonized");
+            run_daemon(socket_filename, init, parent, handler)
+        }
+        Err(e) => {
+            info!("error daemonizing: {}, assuming daemon running", e);
+            notify_daemon_running(parent)
+        }
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn notify_daemon_running(parent: UnixStream) -> Result<(), ()> {
+    let parent = TokioUnixStream::from_std(parent)
+        .map_err(|e| error!("error tokioing UnixStream to fork: {e}"))?;
+    DaemonReadyToken::Running
+        .write_to(parent)
+        .await
+        .map_err(|e| warn!("error writing to parent: {e}"))
+}
 
 impl DaemonControl {
     /// Request daemon shutdown.
@@ -117,85 +189,95 @@ impl DaemonControl {
     }
 }
 
+/// A message sent from a daemon handler to the daemon main loop.
 enum DaemonControlMessage {
+    /// Request daemon shutdown.
+    ///
+    /// Start rejecting further connections and wait until all clients disconnect.
     Shutdown,
 }
 
 /// Run the daemon indefinitely.
 #[tokio::main]
-async fn run_daemon<S, I, IFut, H, HFut>(
+async fn run_daemon<S, SE, I, IFut, H, HFut>(
     socket_filename: &str,
     init: I,
-    child: UnixStream,
+    parent: UnixStream,
     handler: H,
-) -> Result<(), String>
+) -> Result<(), ()>
 where
     I: FnOnce(DaemonControl) -> IFut + Send + 'static,
-    IFut: Future<Output = S> + Send,
+    IFut: Future<Output = Result<S, SE>> + Send,
     S: Send + Sync + 'static,
+    SE: Send + std::fmt::Debug + Display + 'static,
     H: Fn(Arc<S>, TokioUnixStream) -> HFut + Send + 'static,
     HFut: Future<Output = ()> + Send + 'static,
 {
-    let mut child = TokioUnixStream::from_std(child)
-        .map_err(|e| format!("error tokioing UnixStream to fork: {e}"))?;
+    let parent = TokioUnixStream::from_std(parent)
+        .map_err(|e| error!("error tokioing UnixStream to fork: {e}"))?;
 
     let (ready_tx, ready) = oneshot::channel();
     let ready_notifier = tokio::spawn(async move {
-        let token = if let Ok(()) = ready.await {
-            DaemonReadyToken::Forked
-        } else {
-            DaemonReadyToken::Failed
+        let token = match ready.await {
+            Ok(Ok(())) => DaemonReadyToken::Forked,
+            Ok(Err(e)) => DaemonReadyToken::FailedState(e),
+            Err(_) => DaemonReadyToken::Failed,
         };
-        child
-            .write_u32(token as u32)
+        let _ = token
+            .write_to(parent)
             .await
-            .map_err(|e| format!("error writing to fork parent: {e}"))
+            .inspect_err(|e| warn!("error writing to fork parent: {e}"));
     });
 
     let socket_filename = socket_filename.to_owned();
-    let (sender, mut control_receiver) = mpsc::channel(1);
-    let daemon = tokio::spawn(async move {
-        if fs::try_exists(&socket_filename)
+    if fs::try_exists(&socket_filename)
+        .await
+        .map_err(|e| error!("could not use file {socket_filename} as socket: {e}"))?
+    {
+        debug!("attempting to remove old socket file");
+        fs::remove_file(&socket_filename)
             .await
-            .map_err(|e| format!("could not use file {socket_filename} as socket: {e}"))?
-        {
-            debug!("attempting to remove old socket file");
-            fs::remove_file(&socket_filename)
-                .await
-                .map_err(|e| format!("could not remove old socket file: {e}"))?;
-        }
-        let listener = UnixListener::bind(socket_filename)
-            .map_err(|e| format!("error creating socket: {e}"))?;
-        ready_tx.send(()).expect("receiver should not be dropped");
-        debug!("notified socket ready");
-
-        let ctrl = DaemonControl(sender);
-        let state = Arc::new(init(ctrl).await);
-        debug!("started main loop");
-        loop {
-            match select! { biased;
-                Some(DaemonControlMessage::Shutdown) = control_receiver.recv() => { break },
-                a = listener.accept() => a,
-            } {
-                Ok((socket, addr)) => {
-                    info!("accepted from {addr:?}, spawning handler");
-                    let state = Arc::clone(&state);
-                    tokio::spawn(handler(state, socket));
-                }
-                Err(e) => error!("accept function failed: {:?}", e),
-            }
-        }
-        info!("daemon requested shutdown");
-        Ok(())
-    });
-
-    match future::select(ready_notifier, daemon).await {
-        Either::Left((notifier, daemon)) => {
-            notifier.expect("notifier task should not panic")?;
-            daemon.await.expect("daemon task should not panic")
-        }
-        Either::Right((daemon, _)) => daemon.expect("daemon task should not panic"),
+            .map_err(|e| error!("could not remove old socket file: {e}"))?;
     }
+    let listener =
+        UnixListener::bind(socket_filename).map_err(|e| error!("error creating socket: {e}"))?;
+
+    let (sender, mut control_receiver) = mpsc::channel(1);
+    let ctrl = DaemonControl(sender);
+    let init_res = init(ctrl).await;
+    let stringified = init_res.as_ref().map(|_| ()).map_err(|e| e.to_string());
+    ready_tx
+        .send(stringified)
+        .expect("receiver should not be dropped");
+    debug!("notified socket ready");
+
+    let state = init_res.map_err(|e| error!("could not produce initial state: {e}"))?;
+    let state = Arc::new(state);
+
+    debug!("started main loop");
+    let done = wait_token::Waiter::new();
+    loop {
+        match select! { biased;
+            Some(DaemonControlMessage::Shutdown) = control_receiver.recv() => break,
+            a = listener.accept() => a,
+        } {
+            Ok((socket, addr)) => {
+                info!("accepted from {addr:?}, spawning handler");
+                let state = Arc::clone(&state);
+                let token = done.token();
+                let h = handler(state, socket);
+                tokio::spawn(async move {
+                    h.await;
+                    drop(token);
+                });
+            }
+            Err(e) => warn!("accept() failed: {:?}", e),
+        }
+    }
+    done.wait().await;
+    info!("handler-requested shutdown");
+    ready_notifier.await.expect("notifier should not panic");
+    Ok(())
 }
 
 /// Run the client for as long as needed
@@ -204,60 +286,94 @@ async fn run_client<R, C, CFut>(
     socket_filename: &str,
     client: C,
     parent: UnixStream,
-) -> Result<R, String>
+) -> Result<R, Error>
 where
     C: FnOnce(TokioUnixStream) -> CFut,
     CFut: Future<Output = R>,
 {
-    let mut parent = TokioUnixStream::from_std(parent)
-        .map_err(|e| format!("error tokioing UnixStream to fork: {e}"))?;
-    let ready = parent
-        .read_u32()
+    let parent = TokioUnixStream::from_std(parent)
+        .inspect_err(|e| error!("error tokioing UnixStream to fork: {e}"))
+        .map_err(|_| Error::DaemonStatusUnknown)?;
+    let ready = DaemonReadyToken::read_from(parent)
         .await
-        .map_err(|e| format!("error reading from fork parent: {e}"))?;
-    let ready: DaemonReadyToken =
-        num::FromPrimitive::from_u32(ready).expect("ready token should have known value");
+        .inspect_err(|e| error!("error reading from fork parent: {e}"))
+        .map_err(|_| Error::DaemonStatusUnknown)?;
     let stream = connect_to_daemon(ready, socket_filename).await?;
-    info!("parent ready, {:?}, starting client", ready);
+    info!("parent ready, starting client");
     Ok(client(stream).await)
 }
 
 async fn connect_to_daemon(
-    ready: DaemonReadyToken,
+    mut ready: DaemonReadyToken,
     socket_filename: &str,
-) -> Result<TokioUnixStream, String> {
+) -> Result<TokioUnixStream, Error> {
     if ready == DaemonReadyToken::Failed {
-        Err("daemon failed to start".to_string())?
+        Err(Error::DaemonFailed)?
+    }
+    if let DaemonReadyToken::FailedState(ref mut e) = ready {
+        Err(Error::StateFailed(std::mem::take(e)))?
     }
     match TokioUnixStream::connect(socket_filename).await {
         Ok(stream) => Ok(stream),
         Err(e) => match ready {
-            DaemonReadyToken::Forked => Err(format!(
-                "could not communicate with just spawned daemon: {e}"
-            )),
+            DaemonReadyToken::Forked => Err(Error::ConnectionError(e)),
             DaemonReadyToken::Running => {
-                info!("daemon running, but not ready, retrying");
+                info!("daemon running, but not ready: {e}, retrying");
                 tokio::time::sleep(DAEMON_CONNECTION_RETRY_DELAY).await;
                 TokioUnixStream::connect(socket_filename)
                     .await
-                    .map_err(|e| format!("could not communicate with daemon after retry: {e}"))
+                    .map_err(Error::ConnectionError)
             }
-            DaemonReadyToken::Failed => panic!("daemon cannot have failed at this point"),
+            _ => panic!("daemon cannot have failed at this point"),
         },
     }
 }
 
 /// A type to send through a socket between fork()'s parent and child to inform the parent about
 /// the status of the daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, num_derive::FromPrimitive)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonReadyToken {
     /// Daemon has just been forked by the child and is now ready to accept connections.
-    Forked = 0x4ea11e55,
+    Forked,
     /// Daemon has already been running and it is not known if it is ready to accept connections
     /// (but very likely it is).
-    Running = 0x4ea1ab1e,
-    /// Daemon could not be run.
-    Failed = 0x5000dead,
+    Running,
+    /// Daemon could not be run because of an internal error.
+    Failed,
+    /// Daemon could not be run because of a failure to produce a state.
+    ///
+    /// The `init` argument of [`with_daemon`] failed to produce a valid state.
+    FailedState(String),
+}
+
+impl DaemonReadyToken {
+    /// Write the token to writer and shut it down.
+    async fn write_to(self, mut writer: impl AsyncWriteExt + Unpin) -> tokio::io::Result<()> {
+        let (hdr, data) = match self {
+            DaemonReadyToken::Forked => (0x4ea11e55, vec![]),
+            DaemonReadyToken::Running => (0x4ea1ab1e, vec![]),
+            DaemonReadyToken::Failed => (0x5000dead, vec![]),
+            DaemonReadyToken::FailedState(e) => (0x00051a1e, e.into_bytes()),
+        };
+        writer.write_u32(hdr).await?;
+        writer.write_all_buf(&mut Cursor::new(data)).await
+    }
+
+    /// Read a token from reader until EOF.
+    async fn read_from(mut reader: impl AsyncReadExt + Unpin) -> tokio::io::Result<Self> {
+        let hdr = reader.read_u32().await?;
+        Ok(match hdr {
+            0x4ea11e55 => DaemonReadyToken::Forked,
+            0x4ea1ab1e => DaemonReadyToken::Running,
+            0x5000dead => DaemonReadyToken::Failed,
+            0x00051a1e => DaemonReadyToken::FailedState({
+                let mut buf = vec![];
+                reader.read_to_end(&mut buf).await?;
+                String::from_utf8(buf).expect("should decode as utf8")
+            }),
+            _ => panic!("expected one of the valid headers"),
+        })
+    }
 }
 
 const DAEMON_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(10);

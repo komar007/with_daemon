@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use with_daemon::with_daemon;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("none")).init();
     let result = with_daemon(
         "/tmp/with_daemon__example_counter.pid",
         "/tmp/with_daemon__example_counter.sock",
@@ -26,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         //
         // `with_daemon` expects a future that resolves to the initial value of the state here.
         // It awaits that future in the daemon process and passes it to each handler.
-        |_| async { AtomicU32::new(0) },
+        |_| async { Result::<_, String>::Ok(AtomicU32::new(0)) },
         // The handler is given an `Arc` holding the state above and a stream connected
         // bi-directionally to the client it is handling.
         //
