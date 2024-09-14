@@ -24,11 +24,12 @@ type State = Mutex<HashMap<String, Arc<Entry>>>;
 type Entry = Mutex<Option<String>>;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("none")).init();
     let result = with_daemon(
         "/tmp/with_daemon__example_cached_url_retriever.pid",
         "/tmp/with_daemon__example_cached_url_retriever.sock",
         // shared state factory, awaited in the daemon process
-        |_| async { State::default() },
+        |_| async { Result::<_, String>::Ok(State::default()) },
         // handler running in the daemon process, wrapped with a closure for ease of using `?`
         |state, stream| async move {
             if let Err(e) = handler(state, stream).await {
