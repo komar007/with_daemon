@@ -24,7 +24,7 @@ type State = Mutex<HashMap<String, Arc<Entry>>>;
 type Entry = Mutex<Option<String>>;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("none")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off")).init();
     let result = with_daemon(
         "/tmp/with_daemon__example_cached_url_retriever.pid",
         "/tmp/with_daemon__example_cached_url_retriever.sock",
