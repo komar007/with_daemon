@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use with_daemon::with_daemon;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("none")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off")).init();
     let result = with_daemon(
         "/tmp/with_daemon__example_counter.pid",
         "/tmp/with_daemon__example_counter.sock",
