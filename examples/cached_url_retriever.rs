@@ -1,8 +1,8 @@
 //! `with_daemon` example: memory-cached URL retriever.
 //!
 //! This example allows to download each requested URL just once, caching the results in memory.
-//! Of course it is very simple and crude, it only serves the purpose of illustrating a relatively
-//! real-life use of `with_daemon`.
+//! It is very simple and crude, it only serves the purpose of illustrating a relatively real-life
+//! application of `with_daemon`.
 //!
 //! You can execute the compiled binary multiple times and asynchronously and as long as the daemon
 //! is running it should allow only 1 (successful) download of each requested URL and reuse already

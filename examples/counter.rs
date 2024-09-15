@@ -25,10 +25,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         "/tmp/with_daemon__example_counter.sock",
         // In this example the state is just an integer starting from 0.
         //
-        // `with_daemon` expects a future that resolves to the initial value of the state here.
-        // It awaits that future in the daemon process and passes it to each handler.
+        // `with_daemon` expects an async function that returns the initial value of the state here.
+        // It awaits that function in the daemon process and passes the `Ok` result to each handler.
+        //
+        // The init function is fallible, and returning `Err` causes `Error::StateFailed` to be
+        // returned from `with_daemon`.
         |_| async { Result::<_, String>::Ok(AtomicU32::new(0)) },
-        // The handler is given an `Arc` holding the state above and a stream connected
+        // The handler is given an `Arc` holding the state described above and a stream connected
         // bi-directionally to the client it is handling.
         //
         // Here, it increments the state atomically and writes the value back to the client.
@@ -36,7 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let previous = state.fetch_add(1, Ordering::SeqCst);
             let _ = stream.write_u32(previous).await;
         },
-        // The client is given a stream connected bi-directionally to an instance of handler.
+        // The client is given a stream connected bi-directionally to an instance of a handler.
         //
         // Here, it only needs to read the result sent to it by the handler.
         |mut stream| async move { stream.read_u32().await },
