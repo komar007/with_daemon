@@ -1,5 +1,10 @@
 # `with_daemon` - An async client-daemon abstraction framework
 
+![Crates.io License](https://img.shields.io/crates/l/with_daemon)
+[![Crates.io Version](https://img.shields.io/crates/v/with_daemon)](https://crates.io/crates/with_daemon/)
+![GitHub branch check runs](https://img.shields.io/github/check-runs/komar007/with_daemon/main)
+[![docs.rs](https://img.shields.io/docsrs/with_daemon)](https://docs.rs/with_daemon)
+
 This crate abstracts away the spawning of and connecting to a daemon required to optimize tasks
 performed by multiple client instances that are separate processes.
 
