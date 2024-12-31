@@ -13,6 +13,7 @@ keywords = ["daemon", "daemonize", "linux", "unix", "async"]
 
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.76"
 
 
 [dependencies]

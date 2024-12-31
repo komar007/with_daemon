@@ -85,3 +85,18 @@ jobs:
         with:
           command: build
           args: --release
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: cargo install cargo-msrv
+      - name: version_of_cargo_msrv
+        run: cargo msrv --version > $GITHUB_STEP_SUMMARY
+      - run: cargo msrv verify --output-format json -- ./bisect_msrv.sh
