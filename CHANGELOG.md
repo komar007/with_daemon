@@ -1,5 +1,20 @@
 # Changelog of `with_daemon`
 
+## [0.2.1] - 2024-12-31
+
+This release brings only documentation fixes and MSRV declaration.
+
+### 📚 Documentation
+
+- Updated comments in examples
+- Added badges to README.md
+- Minor documentation enhancements
+- Declared MSRV
+
+### ⚙️ Miscellaneous Tasks
+
+- Removed unneeded release-packaging workflow
+
 ## [0.2.0] - 2024-09-14
 
 ### 🚀 Features
