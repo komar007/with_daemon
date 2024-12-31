@@ -1,3 +1,5 @@
+//! Abstract away the spawning of and connecting to a daemon.
+
 use std::{
     fmt::Display, future::Future, io::Cursor, os::unix::net::UnixStream, sync::Arc, time::Duration,
 };
