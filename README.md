@@ -6,7 +6,7 @@
 [![docs.rs](https://img.shields.io/docsrs/with_daemon)](https://docs.rs/with_daemon)
 
 This crate abstracts away the spawning of and connecting to a daemon required to optimize tasks
-performed by multiple client instances that are separate processes.
+performed by multiple client instances that run in separate processes.
 
 The daemon runs in a separate detached process from the first time the client is used and provides
 functionality to multiple instances of the client, taking advantage of the ability to have a common
@@ -14,7 +14,7 @@ state shared between client handlers.
 
 ## Usage
 
-An example is worth more than a hundred words:
+See an example from [`examples/counter.rs`](examples/counter.rs):
 
 ```rust
 //! `with_daemon` example: a simple global counter
@@ -71,4 +71,4 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-You can see another, more complicated example in the `examples/` directory.
+See all examples in [`examples/`](examples/).
